@@ -1,0 +1,498 @@
+name: Build MPP (Magisto + Stayfilm)
+
+# Arquivo único: coloque em .github/workflows/build-mpp.yml de um repositório vazio,
+# abra Actions > Build MPP > Run workflow e baixe o artefato "old-apps-patches-mpp".
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Baixar o molde oficial do Morphe
+        uses: actions/checkout@v4
+        with:
+          repository: MorpheApp/morphe-patches-template
+          path: template
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Escrever os patches
+        run: |
+          D=template/patches/src/main/kotlin/app/morphe/patches/oldapps
+          rm -rf template/patches/src/main/kotlin/app/template/patches/example
+          mkdir -p "$D"
+          cat > "$D/Constants.kt" <<'OLDAPPS_EOF'
+          package app.morphe.patches.oldapps
+
+          import app.morphe.patcher.patch.ApkFileType
+          import app.morphe.patcher.patch.AppTarget
+          import app.morphe.patcher.patch.Compatibility
+
+          /** Magisto, versão de 2012 (versionName 1.0.928, versionCode 18). */
+          internal val COMPATIBILITY_MAGISTO = Compatibility(
+              packageName = "com.magisto",
+              name = "Magisto",
+              apkFileType = ApkFileType.APK,
+              targets = listOf(
+                  AppTarget(
+                      version = "1.0.928",
+                      description = "Magisto de 2012 (versionCode 18). Só tem libs nativas armeabi-v7a (32 bits).",
+                  ),
+              ),
+          )
+
+          /** Stayfilm Fun, versão 1.6.5 de 2015 (versionCode 38, app Cordova/WebView). */
+          internal val COMPATIBILITY_STAYFILM = Compatibility(
+              packageName = "com.stayfilm.fun",
+              name = "Stayfilm",
+              apkFileType = ApkFileType.APK,
+              targets = listOf(
+                  AppTarget(
+                      version = "1.6.5",
+                      description = "Stayfilm 1.6.5 de 2015 (versionCode 38).",
+                  ),
+              ),
+          )
+          OLDAPPS_EOF
+          cat > "$D/Helpers.kt" <<'OLDAPPS_EOF'
+          package app.morphe.patches.oldapps
+
+          import app.morphe.patcher.extensions.InstructionExtensions.addInstructions
+          import app.morphe.patcher.patch.classDefForEach
+          import app.morphe.patcher.patch.mutableClassDefBy
+          import app.morphe.patcher.patch.resourceFile
+          import app.morphe.patcher.util.proxy.mutableTypes.MutableMethod
+          import com.android.tools.smali.dexlib2.AccessFlags
+          import java.util.logging.Logger
+
+          internal val logger: Logger = Logger.getLogger("OldAppsPatches")
+
+          /** Método a ser transformado em "não faz nada". [parameterTypes] nulo = todas as sobrecargas. */
+          internal class MethodTarget(
+              val definingClass: String,
+              val name: String,
+              val parameterTypes: List<String>? = null,
+          ) {
+              fun matches(method: MutableMethod): Boolean =
+                  method.name == name &&
+                      (parameterTypes == null || parameterTypes == method.parameterTypes.map { it.toString() })
+          }
+
+          /** Código smali que devolve um valor "vazio" para o tipo de retorno; null = não suportado. */
+          private fun stubFor(returnType: String): String? = when {
+              returnType == "V" -> "return-void"
+              returnType in setOf("Z", "B", "S", "C", "I", "F") -> "const/4 v0, 0x0\nreturn v0"
+              returnType == "Ljava/lang/Boolean;" ->
+                  "sget-object v0, Ljava/lang/Boolean;->FALSE:Ljava/lang/Boolean;\nreturn-object v0"
+              returnType.startsWith("L") || returnType.startsWith("[") -> "const/4 v0, 0x0\nreturn-object v0"
+              else -> null // J e D precisam de dois registradores
+          }
+
+          private fun registersForParameters(method: MutableMethod): Int {
+              val self = if (AccessFlags.STATIC.isSet(method.accessFlags)) 0 else 1
+              return self + method.parameterTypes.sumOf { type -> if (type.toString() == "J" || type.toString() == "D") 2 else 1 }
+          }
+
+          /**
+           * Insere um retorno imediato no início de cada método alvo.
+           * Devolve quantos métodos foram alterados.
+           */
+          internal fun neutralizeMethods(targets: List<MethodTarget>): Int {
+              val byClass = targets.groupBy { it.definingClass }
+              var patched = 0
+
+              classDefForEach { classDef ->
+                  val wanted = byClass[classDef.type] ?: return@classDefForEach
+                  val mutableClass = mutableClassDefBy(classDef)
+
+                  for (method in mutableClass.methods) {
+                      if (wanted.none { it.matches(method) }) continue
+                      val implementation = method.implementation ?: continue
+                      val stub = stubFor(method.returnType) ?: continue
+
+                      // Os stubs com valor usam v0: o método precisa ter ao menos um registrador local.
+                      if ("v0" in stub && implementation.registerCount - registersForParameters(method) < 1) {
+                          logger.warning("Sem registrador livre em ${method.definingClass}->${method.name}, ignorado.")
+                          continue
+                      }
+
+                      method.addInstructions(0, stub)
+                      patched++
+                  }
+              }
+
+              return patched
+          }
+
+          /** Lê um arquivo do APK, aplica [transform] e grava de volta. Devolve true se houve mudança. */
+          internal fun editFile(path: String, transform: (String) -> String): Boolean {
+              val file = try {
+                  resourceFile(path)
+              } catch (e: Exception) {
+                  logger.warning("Não foi possível abrir $path: ${e.message}")
+                  return false
+              }
+              if (!file.exists()) {
+                  logger.warning("Arquivo não encontrado no APK: $path")
+                  return false
+              }
+              val original = file.readText()
+              val edited = transform(original)
+              if (edited == original) {
+                  logger.warning("Nada para alterar em $path (o texto esperado não foi encontrado).")
+                  return false
+              }
+              file.writeText(edited)
+              return true
+          }
+          OLDAPPS_EOF
+          cat > "$D/MagistoPatches.kt" <<'OLDAPPS_EOF'
+          package app.morphe.patches.oldapps
+
+          import app.morphe.patcher.extensions.InstructionExtensions.replaceInstruction
+          import app.morphe.patcher.patch.classDefForEach
+          import app.morphe.patcher.patch.document
+          import app.morphe.patcher.patch.mutableClassDefBy
+          import app.morphe.patcher.patch.patch
+          import app.morphe.patcher.patch.stringOption
+          import com.android.tools.smali.dexlib2.Opcode
+          import com.android.tools.smali.dexlib2.iface.instruction.OneRegisterInstruction
+          import com.android.tools.smali.dexlib2.iface.instruction.ReferenceInstruction
+          import com.android.tools.smali.dexlib2.iface.reference.StringReference
+
+          private const val DEFAULT_MAGISTO_HOST = "www.magisto.com"
+
+          /** Remove do manifest o receiver do AdX (rastreador de instalação por anúncio). */
+          private val magistoRemoveAdXReceiverPatch = patch {
+              compatibleWith(COMPATIBILITY_MAGISTO)
+
+              execute {
+                  document("AndroidManifest.xml").use { document ->
+                      val receivers = document.getElementsByTagName("receiver")
+                      val toRemove = (0 until receivers.length)
+                          .map { receivers.item(it) as org.w3c.dom.Element }
+                          .filter { it.getAttribute("android:name") == "com.AdX.tag.AdXAppTracker" }
+                      toRemove.forEach { it.parentNode.removeChild(it) }
+                  }
+              }
+          }
+
+          private val MAGISTO_TRACKER_TARGETS = listOf(
+              // Google Analytics (biblioteca antiga com.google.android.apps.analytics), usada em UsageStats
+              MethodTarget("Lcom/google/android/apps/analytics/GoogleAnalyticsTracker;", "startNewSession"),
+              MethodTarget("Lcom/google/android/apps/analytics/GoogleAnalyticsTracker;", "stopSession"),
+              MethodTarget("Lcom/google/android/apps/analytics/GoogleAnalyticsTracker;", "trackEvent"),
+              MethodTarget("Lcom/google/android/apps/analytics/GoogleAnalyticsTracker;", "dispatch"),
+
+              // BugSense (relatório de falhas), usado em Logger
+              MethodTarget("Lcom/bugsense/trace/BugSenseHandler;", "initAndStartSession"),
+              MethodTarget("Lcom/bugsense/trace/BugSenseHandler;", "installHandler"),
+              MethodTarget("Lcom/bugsense/trace/BugSenseHandler;", "sendException"),
+              MethodTarget("Lcom/bugsense/trace/BugSenseHandler;", "sendExceptionMap"),
+              MethodTarget("Lcom/bugsense/trace/BugSenseHandler;", "sendExceptionMessage"),
+              MethodTarget("Lcom/bugsense/trace/BugSenseHandler;", "addCrashExtraData"),
+              MethodTarget("Lcom/bugsense/trace/BugSenseHandler;", "addCrashExtraMap"),
+              MethodTarget("Lcom/bugsense/trace/BugSenseHandler;", "closeSession"),
+              MethodTarget("Lcom/bugsense/trace/BugSenseHandler;", "flush"),
+
+              // AdX (atribuição de instalação): as duas AsyncTasks que fazem a requisição HTTP.
+              // Só a versão (Void[]) -> Boolean; o método-ponte (Object[]) -> Object chama essa.
+              MethodTarget("Lcom/AdX/tag/AdXConnect\$ConnectTask;", "doInBackground", listOf("[Ljava/lang/Void;")),
+              MethodTarget("Lcom/AdX/tag/AdXConnect\$ConnectEventTask;", "doInBackground", listOf("[Ljava/lang/Void;")),
+
+              // AppsFire AppBooster (divulgação cruzada de apps / "notificações" patrocinadas)
+              MethodTarget("Lcom/appsfire/appbooster/jar/af_NotificationsManager;", "start"),
+              MethodTarget("Lcom/appsfire/appbooster/jar/af_NotificationsManager;", "show"),
+              MethodTarget("Lcom/magisto/activities/MainTabActivity;", "refreshAppBooster"),
+          )
+
+          val magistoBlockAdsAndTrackersPatch = patch(
+              name = "Magisto: bloquear anúncios e rastreadores",
+              description = "Desativa Google Analytics, BugSense, AdX e o AppsFire AppBooster no Magisto 2012.",
+              default = true,
+          ) {
+              compatibleWith(COMPATIBILITY_MAGISTO)
+              dependsOn(magistoRemoveAdXReceiverPatch)
+
+              execute {
+                  val patched = neutralizeMethods(MAGISTO_TRACKER_TARGETS)
+                  logger.info("Magisto: $patched métodos neutralizados.")
+              }
+          }
+
+          private fun smaliString(value: String): String =
+              "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+
+          val magistoServerUrlPatch = patch(
+              name = "Magisto: trocar servidor",
+              description = "Troca www.magisto.com por outro host em todas as URLs fixas do app " +
+                  "(API http/https, reset de senha, termos, FAQ e links de vídeo).",
+              default = false,
+          ) {
+              compatibleWith(COMPATIBILITY_MAGISTO)
+
+              val serverHost by stringOption(
+                  key = "serverHost",
+                  default = DEFAULT_MAGISTO_HOST,
+                  title = "Host do servidor",
+                  description = "Ex.: meuservidor.com ou 192.168.0.10:8080. O app usa /api/ nesse host.",
+                  required = true,
+              )
+
+              execute {
+                  val host = serverHost?.trim().orEmpty()
+                  if (host.isEmpty() || host == DEFAULT_MAGISTO_HOST) {
+                      logger.info("Magisto: host não alterado, nada a fazer.")
+                      return@execute
+                  }
+
+                  var replaced = 0
+
+                  classDefForEach { classDef ->
+                      if (!classDef.type.startsWith("Lcom/magisto/")) return@classDefForEach
+
+                      // Passo 1: procura (sem alterar nada) as strings que apontam para o servidor.
+                      class Hit(val method: com.android.tools.smali.dexlib2.iface.Method, val index: Int, val smali: String)
+
+                      val hits = mutableListOf<Hit>()
+                      for (method in classDef.methods) {
+                          val instructions = method.implementation?.instructions ?: continue
+                          instructions.forEachIndexed { index, instruction ->
+                              if (instruction.opcode != Opcode.CONST_STRING) return@forEachIndexed
+                              val value = ((instruction as ReferenceInstruction).reference as StringReference).string
+                              // Só URLs completas. A string "www.magisto.com" sozinha é chave OAuth do Google.
+                              if (!value.startsWith("http://$DEFAULT_MAGISTO_HOST") &&
+                                  !value.startsWith("https://$DEFAULT_MAGISTO_HOST")
+                              ) return@forEachIndexed
+
+                              val register = (instruction as OneRegisterInstruction).registerA
+                              val newValue = value.replace(DEFAULT_MAGISTO_HOST, host)
+                              hits += Hit(method, index, "const-string v$register, ${smaliString(newValue)}")
+                          }
+                      }
+                      if (hits.isEmpty()) return@classDefForEach
+
+                      // Passo 2: aplica as trocas no método mutável equivalente.
+                      val mutableClass = mutableClassDefBy(classDef)
+                      for (hit in hits) {
+                          val target = mutableClass.methods.first {
+                              it.name == hit.method.name &&
+                                  it.returnType == hit.method.returnType &&
+                                  it.parameterTypes.map { p -> p.toString() } ==
+                                  hit.method.parameterTypes.map { p -> p.toString() }
+                          }
+                          target.replaceInstruction(hit.index, hit.smali)
+                          replaced++
+                      }
+                  }
+
+                  logger.info("Magisto: $replaced URLs apontadas para $host.")
+              }
+          }
+          OLDAPPS_EOF
+          cat > "$D/ModernAndroidCompatibilityPatch.kt" <<'OLDAPPS_EOF'
+          package app.morphe.patches.oldapps
+
+          import app.morphe.patcher.patch.document
+          import app.morphe.patcher.patch.patch
+          import org.w3c.dom.Element
+
+          /**
+           * targetSdk que o app passa a declarar.
+           * 28 é o meio-termo: o Android 14+ recusa instalar apps com targetSdk < 23
+           * (o 15 recusa < 24), e abaixo de 29 o armazenamento externo antigo continua
+           * funcionando sem scoped storage. Aumente só se souber o que está fazendo:
+           * a partir de 23 as permissões viram "em tempo de execução".
+           */
+          private const val TARGET_SDK = "28"
+
+          private val COMPONENT_TAGS = listOf("activity", "activity-alias", "service", "receiver", "provider")
+
+          private fun Element.childrenNamed(tag: String): List<Element> {
+              val result = mutableListOf<Element>()
+              val nodes = childNodes
+              for (i in 0 until nodes.length) {
+                  val node = nodes.item(i)
+                  if (node is Element && node.tagName == tag) result += node
+              }
+              return result
+          }
+
+          val modernAndroidCompatibilityPatch = patch(
+              name = "Compatibilidade com Android moderno",
+              description = "Ajusta o AndroidManifest do Magisto (2012) e do Stayfilm 1.6.5 (2015) para " +
+                  "instalar e abrir em versões recentes do Android: sobe o targetSdk, libera tráfego HTTP, " +
+                  "mantém o armazenamento externo antigo e declara android:exported nos componentes.",
+              default = true,
+          ) {
+              compatibleWith(COMPATIBILITY_MAGISTO, COMPATIBILITY_STAYFILM)
+
+              execute {
+                  document("AndroidManifest.xml").use { document ->
+                      val manifest = document.documentElement
+
+                      // 1) targetSdk: sem isso o Android 14+ recusa a instalação.
+                      val usesSdk = manifest.childrenNamed("uses-sdk").firstOrNull()
+                          ?: document.createElement("uses-sdk").also { manifest.appendChild(it) }
+                      usesSdk.setAttribute("android:targetSdkVersion", TARGET_SDK)
+
+                      // 2) application: HTTP em texto puro (os apps antigos usam http://)
+                      //    e armazenamento externo legado.
+                      val application = manifest.childrenNamed("application").first()
+                      application.setAttribute("android:usesCleartextTraffic", "true")
+                      application.setAttribute("android:requestLegacyExternalStorage", "true")
+
+                      // 3) android:exported explícito em tudo que tem intent-filter.
+                      //    Antes do Android 12 esses componentes eram exportados por padrão,
+                      //    então "true" preserva o comportamento original.
+                      for (tag in COMPONENT_TAGS) {
+                          for (component in application.childrenNamed(tag)) {
+                              val hasFilter = component.childrenNamed("intent-filter").isNotEmpty()
+                              if (hasFilter && !component.hasAttribute("android:exported")) {
+                                  component.setAttribute("android:exported", "true")
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+          OLDAPPS_EOF
+          cat > "$D/StayfilmPatches.kt" <<'OLDAPPS_EOF'
+          package app.morphe.patches.oldapps
+
+          import app.morphe.patcher.extensions.InstructionExtensions.replaceInstruction
+          import app.morphe.patcher.patch.classDefForEach
+          import app.morphe.patcher.patch.mutableClassDefBy
+          import app.morphe.patcher.patch.patch
+          import app.morphe.patcher.patch.stringOption
+          import com.android.tools.smali.dexlib2.Opcode
+          import com.android.tools.smali.dexlib2.iface.instruction.ReferenceInstruction
+          import com.android.tools.smali.dexlib2.iface.reference.MethodReference
+
+          private const val DEFAULT_STAYFILM_URL = "http://www.stayfilm.com"
+
+          /**
+           * O Stayfilm 1.6.5 é um app Cordova: a interface roda em assets/www (AngularJS).
+           * Os endereços e os rastreadores de JavaScript ficam nesses arquivos.
+           */
+          val stayfilmServerUrlPatch = patch(
+              name = "Stayfilm: trocar servidor",
+              description = "Troca o endereço do ambiente 'prod' (padrão do app) em assets/www/common.js.",
+              default = false,
+          ) {
+              compatibleWith(COMPATIBILITY_STAYFILM)
+
+              val serverUrl by stringOption(
+                  key = "serverUrl",
+                  default = DEFAULT_STAYFILM_URL,
+                  title = "URL do servidor",
+                  description = "Ex.: http://meuservidor.com (sem barra no final).",
+                  required = true,
+              )
+
+              execute {
+                  val url = serverUrl?.trim()?.trimEnd('/').orEmpty()
+                  if (url.isEmpty() || url == DEFAULT_STAYFILM_URL) {
+                      logger.info("Stayfilm: URL não alterada, nada a fazer.")
+                      return@execute
+                  }
+
+                  editFile("assets/www/common.js") {
+                      it.replace("prod: '$DEFAULT_STAYFILM_URL'", "prod: '$url'")
+                  }
+              }
+          }
+
+          /** Neutraliza Google Analytics, Pushwoosh e AdMob no JavaScript do app. */
+          private val stayfilmWebTrackersPatch = patch {
+              compatibleWith(COMPATIBILITY_STAYFILM)
+
+              execute {
+                  // Google Analytics: chamadas ao plugin nativo "analytics" e o script web do GA
+                  val noop = "(function(){})("
+                  val gaCall = Regex("""\banalytics\.(startTrackerWithId|trackView|debugMode)\(""")
+                  editFile("assets/www/src/services/GaServ.js") {
+                      gaCall.replace(it, noop).replace("'//www.google-analytics.com/analytics.js'", "'data:text/javascript,'")
+                  }
+                  editFile("assets/www/src/modal/watch/WatchModal.js") { gaCall.replace(it, noop) }
+
+                  // Pushwoosh: a função de inicialização passa a sair imediatamente
+                  editFile("assets/www/src/services/PushServ.js") {
+                      it.replace(
+                          "initPushwoosh: function initPushwoosh() {",
+                          "initPushwoosh: function initPushwoosh() {\n\t\t\t\treturn;",
+                      )
+                  }
+
+                  // AdMob: o banner só é criado se window.AdMob existir; força o ramo "não existe"
+                  editFile("assets/www/src/services/AdMobServ.js") {
+                      it.replace("if (window.AdMob) {", "if (false) {")
+                  }
+              }
+          }
+
+          val stayfilmBlockAdsAndTrackersPatch = patch(
+              name = "Stayfilm: bloquear anúncios e rastreadores",
+              description = "Desativa Google Analytics, Pushwoosh, AdMob (JavaScript) e Crashlytics/Fabric (nativo) no Stayfilm 1.6.5.",
+              default = true,
+          ) {
+              compatibleWith(COMPATIBILITY_STAYFILM)
+              dependsOn(stayfilmWebTrackersPatch)
+
+              execute {
+                  // Crashlytics: CordovaApp.onCreate chama Fabric.with(this, new Crashlytics()).
+                  // Nenhum outro código do app usa o Crashlytics, então a chamada pode sair.
+                  var removed = 0
+
+                  classDefForEach { classDef ->
+                      if (classDef.type != "Lcom/stayfilm/fun/CordovaApp;") return@classDefForEach
+
+                      val mutableClass = mutableClassDefBy(classDef)
+                      val onCreate = mutableClass.methods.first { it.name == "onCreate" }
+                      val instructions = onCreate.implementation?.instructions ?: return@classDefForEach
+
+                      val calls = instructions.withIndex().filter { (_, instruction) ->
+                          val reference = (instruction as? ReferenceInstruction)?.reference as? MethodReference
+                          reference != null &&
+                              reference.definingClass == "Lio/fabric/sdk/android/Fabric;" &&
+                              reference.name == "with"
+                      }.map { it.index }
+
+                      for (index in calls.sortedDescending()) {
+                          // O move-result-object que segue a chamada (se houver) também precisa sair.
+                          if (instructions.getOrNull(index + 1)?.opcode == Opcode.MOVE_RESULT_OBJECT) {
+                              onCreate.replaceInstruction(index + 1, "nop")
+                          }
+                          onCreate.replaceInstruction(index, "nop")
+                          removed++
+                      }
+                  }
+
+                  logger.info("Stayfilm: $removed chamadas ao Fabric removidas.")
+              }
+          }
+          OLDAPPS_EOF
+          sed -i 's/name = "UserXYZ Patches"/name = "Old Apps Patches"/; s/description = "Patches for apps I like"/description = "Patches para Magisto 2012 e Stayfilm 1.6.5"/' template/patches/build.gradle.kts
+
+      - name: Compilar
+        working-directory: template
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          chmod +x gradlew
+          ./gradlew build
+
+      - name: Publicar o .mpp
+        uses: actions/upload-artifact@v4
+        with:
+          name: old-apps-patches-mpp
+          path: template/**/build/libs/*.mpp
